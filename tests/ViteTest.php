@@ -7,11 +7,13 @@ namespace PhpSoftBox\Vite\Tests;
 use PhpSoftBox\Vite\Vite;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversMethod;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
 use function file_put_contents;
 use function json_encode;
+use function substr_count;
 use function sys_get_temp_dir;
 use function tempnam;
 use function unlink;
@@ -171,5 +173,167 @@ final class ViteTest extends TestCase
         $this->assertSame('http://node:13714/render', $vite->ssrUrl());
         $this->assertSame('resources/js/ssr.tsx', $vite->ssrEntry());
         $this->assertSame(3.5, $vite->ssrTimeout());
+    }
+
+    /**
+     * Проверим, что CSS-entrypoint в build-режиме выводится как stylesheet, а не как ES-модуль.
+     *
+     * @see Vite::tags()
+     */
+    #[Test]
+    public function cssEntrypointInBuildModeRendersStylesheet(): void
+    {
+        $manifestFile = $this->createManifest([
+            'resources/css/app.css' => [
+                'file'    => 'assets/app.abc.css',
+                'isEntry' => true,
+            ],
+        ]);
+
+        $vite = new Vite(
+            manifestPath: $manifestFile,
+            hotFile: $manifestFile . '.hot',
+            environment: 'prod',
+        );
+
+        $tags = $vite->tags('resources/css/app.css');
+
+        self::assertSame('<link rel="stylesheet" href="/build/assets/app.abc.css">', $tags);
+
+        unlink($manifestFile);
+    }
+
+    /**
+     * Проверим, что CSS-entrypoint в dev-режиме выводится как stylesheet с адресом dev-server.
+     *
+     * @see Vite::tags()
+     */
+    #[Test]
+    public function cssEntrypointInDevModeRendersStylesheet(): void
+    {
+        $vite = new Vite(
+            manifestPath: '/app/public/build/manifest.json',
+            hotFile: '/app/public/hot',
+            devServer: 'https://vite.local',
+            environment: 'dev',
+        );
+
+        $tags = $vite->tags('resources/css/app.css');
+
+        self::assertStringContainsString('<link rel="stylesheet" href="https://vite.local/resources/css/app.css">', $tags);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function productionLikeEnvironments(): iterable
+    {
+        yield 'prod' => ['prod'];
+        yield 'production' => ['production'];
+        yield 'staging' => ['staging'];
+        yield 'stage' => ['stage'];
+    }
+
+    /**
+     * Проверим, что production-подобное окружение не считается dev, даже если задан dev-server.
+     *
+     * @see Vite::isDev()
+     * @see Vite::devServerUrl()
+     */
+    #[Test]
+    #[DataProvider('productionLikeEnvironments')]
+    public function productionLikeEnvironmentIsNotDev(string $environment): void
+    {
+        $vite = new Vite(
+            manifestPath: '/app/public/build/manifest.json',
+            hotFile: '/app/public/hot',
+            devServer: 'https://vite.local',
+            environment: $environment,
+        );
+
+        self::assertFalse($vite->isDev());
+        self::assertNull($vite->devServerUrl());
+    }
+
+    /**
+     * Проверим, что явный флаг dev имеет приоритет над окружением.
+     *
+     * @see Vite::isDev()
+     */
+    #[Test]
+    public function explicitDevFlagOverridesEnvironment(): void
+    {
+        $forcedDev = new Vite(
+            manifestPath: '/app/public/build/manifest.json',
+            hotFile: '/app/public/hot',
+            environment: 'production',
+            dev: true,
+        );
+        $forcedBuild = new Vite(
+            manifestPath: '/app/public/build/manifest.json',
+            hotFile: '/app/public/hot',
+            environment: 'dev',
+            dev: false,
+        );
+
+        self::assertTrue($forcedDev->isDev());
+        self::assertFalse($forcedBuild->isDev());
+    }
+
+    /**
+     * Проверим, что hash manifest вычисляется один раз и кешируется в экземпляре.
+     *
+     * @see Vite::version()
+     */
+    #[Test]
+    public function versionIsCachedPerInstance(): void
+    {
+        $manifestFile = $this->createManifest(['a' => ['file' => 'a.js']]);
+
+        $vite = new Vite(
+            manifestPath: $manifestFile,
+            hotFile: $manifestFile . '.hot',
+            environment: 'prod',
+        );
+
+        $version = $vite->version();
+        file_put_contents($manifestFile, '{"changed":true}');
+
+        self::assertNotSame('dev', $version);
+        self::assertSame($version, $vite->version());
+
+        unlink($manifestFile);
+    }
+
+    /**
+     * Проверим, что URL dev-server в React Refresh preamble экранируется для вставки в <script>.
+     *
+     * @see Vite::reactRefreshPreamble()
+     */
+    #[Test]
+    public function reactRefreshPreambleEscapesUrl(): void
+    {
+        $vite = new Vite(
+            manifestPath: '/app/public/build/manifest.json',
+            hotFile: '/app/public/hot',
+            devServer: 'https://vite.local/</script><script>alert(1)',
+            environment: 'dev',
+        );
+
+        $preamble = $vite->reactRefreshPreamble();
+
+        self::assertSame(1, substr_count($preamble, '</script>'));
+        self::assertStringContainsString('\u003C/script\u003E', $preamble);
+    }
+
+    /**
+     * @param array<string, mixed> $manifest
+     */
+    private function createManifest(array $manifest): string
+    {
+        $manifestFile = tempnam(sys_get_temp_dir(), 'vite-manifest-');
+        file_put_contents($manifestFile, json_encode($manifest, JSON_THROW_ON_ERROR));
+
+        return $manifestFile;
     }
 }

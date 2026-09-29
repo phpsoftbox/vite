@@ -14,6 +14,7 @@ use function array_values;
 use function file_get_contents;
 use function htmlspecialchars;
 use function implode;
+use function in_array;
 use function is_array;
 use function is_file;
 use function is_string;
@@ -21,17 +22,36 @@ use function json_decode;
 use function json_encode;
 use function ltrim;
 use function md5_file;
+use function preg_match;
 use function rtrim;
+use function strtolower;
 use function trim;
 
 use const ENT_QUOTES;
 use const ENT_SUBSTITUTE;
+use const JSON_HEX_AMP;
+use const JSON_HEX_APOS;
+use const JSON_HEX_QUOT;
+use const JSON_HEX_TAG;
 use const JSON_THROW_ON_ERROR;
 use const JSON_UNESCAPED_SLASHES;
 
 final class Vite
 {
+    /**
+     * Окружения, которые считаются dev, если флаг `dev` не задан явно.
+     * Любое другое окружение (prod, production, staging, ...) — build-режим.
+     */
+    public const array DEV_ENVIRONMENTS = ['dev', 'development', 'local', 'test', 'testing'];
+
+    /**
+     * Расширения файлов, которые подключаются как стили.
+     */
+    private const string CSS_PATTERN = '/\\.(css|less|sass|scss|styl|stylus|pcss|postcss)(\\?[^.]*)?$/i';
+
     private ?array $manifest = null;
+
+    private ?string $version = null;
 
     public function __construct(
         private readonly string $manifestPath,
@@ -42,6 +62,7 @@ final class Vite
         private readonly ?string $ssrUrl = null,
         private readonly ?string $ssrEntry = null,
         private readonly float $ssrTimeout = 2.0,
+        private readonly ?bool $dev = null,
     ) {
     }
 
@@ -64,7 +85,8 @@ final class Vite
             $tags = [$this->scriptTag($devServer . '/@vite/client')];
 
             foreach ($entrypoints as $entry) {
-                $tags[] = $this->scriptTag($devServer . '/' . ltrim($entry, '/'));
+                $url    = $devServer . '/' . ltrim($entry, '/');
+                $tags[] = $this->isCssPath($entry) ? $this->styleTag($url) : $this->scriptTag($url);
             }
 
             return implode("\n", $tags);
@@ -88,7 +110,12 @@ final class Vite
             $this->collectChunkAssets($entry, $manifest, $styles, $preloads, $visited, false);
 
             if (isset($data['file']) && is_string($data['file']) && $data['file'] !== '') {
-                $scripts[$data['file']] = true;
+                // CSS-entrypoint подключается как stylesheet, а не как ES-модуль.
+                if ($this->isCssPath($data['file'])) {
+                    $styles[$data['file']] = true;
+                } else {
+                    $scripts[$data['file']] = true;
+                }
             }
         }
 
@@ -108,16 +135,23 @@ final class Vite
         return implode("\n", $tags);
     }
 
+    /**
+     * Версия ассетов: md5 manifest в build-режиме (вычисляется один раз на экземпляр) или `dev`.
+     */
     public function version(): string
     {
         if ($this->devServerUrl() !== null) {
             return 'dev';
         }
 
+        if ($this->version !== null) {
+            return $this->version;
+        }
+
         if (is_file($this->manifestPath)) {
             $hash = md5_file($this->manifestPath);
             if (is_string($hash) && $hash !== '') {
-                return $hash;
+                return $this->version = $hash;
             }
         }
 
@@ -132,7 +166,7 @@ final class Vite
         }
 
         $refreshUrl   = $devServer . '/@react-refresh';
-        $refreshUrlJs = json_encode($refreshUrl, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $refreshUrlJs = json_encode($refreshUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR);
 
         return '<script type="module">' .
             'import RefreshRuntime from ' . $refreshUrlJs . ';' .
@@ -143,9 +177,17 @@ final class Vite
             '</script>';
     }
 
+    /**
+     * Dev-режим: явный флаг `dev`, а если он не задан — окружение из белого списка DEV_ENVIRONMENTS.
+     * Неизвестные окружения считаются production (dev-server теги не выводятся).
+     */
     public function isDev(): bool
     {
-        return $this->environment !== 'prod';
+        if ($this->dev !== null) {
+            return $this->dev;
+        }
+
+        return in_array(strtolower(trim($this->environment)), self::DEV_ENVIRONMENTS, true);
     }
 
     public function devServerUrl(): ?string
@@ -277,6 +319,11 @@ final class Vite
         $this->manifest = $data;
 
         return $data;
+    }
+
+    private function isCssPath(string $path): bool
+    {
+        return preg_match(self::CSS_PATTERN, $path) === 1;
     }
 
     private function scriptTag(string $src): string
